@@ -4,12 +4,13 @@
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
+from types import MethodType
 from typing import Any, TypeAlias, cast
 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import FloatTensor, LongTensor, Tensor
-from torch.nn import Module, ModuleList
+from torch.nn import Linear, Module, ModuleList, Parameter
 from torch.utils.hooks import RemovableHandle
 from transformers import (
     AutoModelForCausalLM,
@@ -56,6 +57,160 @@ def strftime_fixed_date(format: str) -> str:
 # from the module index to an (input, output) tuple containing the I/O
 # tensors of shape (prompt, component).
 ModuleIO: TypeAlias = list[dict[str, dict[int, tuple[Tensor, Tensor]]]]
+
+
+class ExpertDownProj(Linear):
+    """
+    A Linear view of one expert's down_proj matrix in a MoE experts module
+    that stores all routed experts as stacked 3D parameters (e.g. Qwen3.5 MoE).
+
+    The weight shares storage with the underlying stacked
+    (num_experts, hidden_dim, intermediate_dim) parameter, so in-place weight
+    modifications (in particular LoRA merges) are written through to the
+    stacked parameter. The module is excluded from state_dict saving/loading,
+    because the stacked parameter already contains the same values.
+    """
+
+    weight: Parameter
+
+    def __init__(self, stacked_down_proj: Parameter, expert_index: int):
+        hidden_dim = stacked_down_proj.shape[1]
+        intermediate_dim = stacked_down_proj.shape[2]
+
+        # The randomly initialized weight created below is immediately
+        # replaced with the shared-storage view.
+        super().__init__(
+            in_features=intermediate_dim,
+            out_features=hidden_dim,
+            bias=False,
+        )
+        self.weight = Parameter(stacked_down_proj.data[expert_index])
+
+    def _save_to_state_dict(
+        self,
+        destination: dict[str, Tensor],
+        prefix: str,
+        keep_vars: bool,
+    ) -> None:
+        # The stacked down_proj parameter is saved by the experts module
+        # that owns this view; saving the view as well would duplicate it.
+        pass
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        # See _save_to_state_dict.
+        pass
+
+
+def _expose_stacked_experts(experts: Module) -> None:
+    """
+    Makes a MoE experts module that stores all routed experts as stacked
+    3D parameters (e.g. Qwen3.5 MoE) abliterable.
+
+    Registers one ExpertDownProj view per expert on the module, and replaces
+    the module's forward with an equivalent computation that routes each
+    routed expert's down-projection through its view, so that LoRA adapters
+    attached to the views take effect during inference, and are written to
+    the stacked parameter when the adapters are merged.
+
+    Idempotent. Raises TypeError (caught by the callers in
+    get_layer_modules) if the module is not a supported stacked-experts
+    container, in which case the routed experts simply remain undiscovered.
+    """
+    if hasattr(experts, "expert_down"):
+        return
+
+    down_proj = getattr(experts, "down_proj", None)
+    gate_up_proj = getattr(experts, "gate_up_proj", None)
+
+    if (
+        not isinstance(down_proj, Parameter)
+        or (down_proj.dim() != 3)
+        or (getattr(down_proj, "quant_state", None) is not None)
+        or not isinstance(gate_up_proj, Parameter)
+    ):
+        raise TypeError(
+            f"Unsupported stacked MoE experts module: {type(experts).__name__}"
+        )
+
+    experts.expert_down = ModuleList(  # ty: ignore[unresolved-attribute]
+        [
+            ExpertDownProj(down_proj, expert_index)
+            for expert_index in range(down_proj.shape[0])
+        ]
+    )
+
+    # This mirrors the reference (eager) implementation of the experts
+    # module, with the single change that the routed experts' down-projections
+    # are computed by the views above instead of by slicing the stacked
+    # parameter directly.
+    def forward(
+        self: Module,
+        hidden_states: Tensor,
+        top_k_index: Tensor,
+        top_k_weights: Tensor,
+    ) -> Tensor:
+        final_hidden_states = torch.zeros_like(hidden_states)
+
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(
+                top_k_index,
+                num_classes=self.num_experts + 1,  # ty: ignore[unresolved-attribute]
+            )
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = (
+                torch.greater(expert_mask.sum(dim=(-1, -2)), 0)
+            ).nonzero()
+
+        for expert_index in expert_hit:
+            expert_index = expert_index[0]
+            if expert_index == self.num_experts:  # ty: ignore[unresolved-attribute]
+                continue
+
+            top_k_positions, token_indices = torch.where(
+                expert_mask[expert_index]
+            )
+            current_state = hidden_states[token_indices]
+
+            gate, up = torch.nn.functional.linear(
+                current_state,
+                self.gate_up_proj[expert_index],  # ty: ignore[unresolved-attribute]
+            ).chunk(2, dim=-1)
+            current_hidden_states = (
+                self.act_fn(gate) * up  # ty: ignore[unresolved-attribute]
+            )
+
+            current_hidden_states = self.expert_down[  # ty: ignore[unresolved-attribute]
+                expert_index
+            ](current_hidden_states)
+
+            current_hidden_states = current_hidden_states * top_k_weights[
+                token_indices, top_k_positions, None
+            ]
+
+            final_hidden_states.index_add_(
+                0,
+                token_indices,
+                current_hidden_states.to(final_hidden_states.dtype),
+            )
+
+        return final_hidden_states
+
+    # Assigning to the instance attribute (rather than the class attribute)
+    # shadows the module class's own forward implementation, which computes
+    # the down-projections directly from the stacked parameter.
+    experts.forward = MethodType(  # ty: ignore[unresolved-attribute]
+        forward,
+        experts,
+    )
 
 
 class Model:
@@ -414,6 +569,22 @@ class Model:
         with suppress(Exception):
             for expert in layer.mlp.experts:  # ty:ignore[not-iterable, unresolved-attribute]
                 try_add("mlp.down_proj", expert.down_proj)  # ty: ignore[unresolved-attribute]
+
+        # MoE models whose routed experts are stored as stacked 3D parameters
+        # on a single container module (e.g. Qwen3.5 MoE), rather than as a
+        # list of per-expert modules. Expose one Linear view per routed
+        # expert's down_proj, then add the views like regular modules.
+        with suppress(Exception):
+            experts = layer.mlp.experts  # ty: ignore[unresolved-attribute]
+            if not isinstance(experts, ModuleList):
+                _expose_stacked_experts(experts)
+                for expert_down in experts.expert_down:  # ty: ignore[unresolved-attribute]
+                    try_add("mlp.down_proj", expert_down)
+
+        # Shared expert of MoE models with a dedicated always-on expert
+        # (e.g. Qwen3, Qwen3.5 MoE).
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mlp.shared_expert.down_proj)  # ty: ignore[unresolved-attribute]
 
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):

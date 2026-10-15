@@ -1,5 +1,21 @@
 # Test Suite Guide
 
+## Component-discovery check
+
+`check_expert_component_discovery.py` verifies on a local model directory
+(the tiny-random qwen3.5-moe fixture by default) that MoE routed-expert and
+shared-expert `down_proj` modules are discovered as abliterable components
+and actually work with the downstream abliteration consumer (LoRA adapters
+applied as `v @ W`, adapter changes reaching inference, and merges writing
+through to the stacked expert weights):
+
+```bash
+python tests/check_expert_component_discovery.py <model-path-or-id>
+```
+
+It imports heretic from this repository's `src` directory, so it can be run
+with any environment that has heretic's dependencies installed.
+
 Whenever we change any code-logic related to `src/heretic/model.py` or `config.toml` *(e.g. `row_normalization`, `full_normalization_lora_rank`, `winsorization_quantile`, etc)* which can affect a model's reproduciblity; Use these tests which are designed to verify that those changes does not affect reproducibility, unless they are meant to (like when we'll integrate ARA branch in future).
 
 ## How to test
