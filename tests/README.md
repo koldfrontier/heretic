@@ -16,6 +16,25 @@ python tests/check_expert_component_discovery.py <model-path-or-id>
 It imports heretic from this repository's `src` directory, so it can be run
 with any environment that has heretic's dependencies installed.
 
+## Attention out-projection discovery check
+
+`check_attention_out_proj_discovery.py` verifies that the attention block's
+output projection - the Linear that writes the attention output back to the
+residual stream - is discovered under every naming scheme a model may use for
+it, including the two schemes of a single hybrid model (`self_attn.o_proj` on
+its full attention layers, `linear_attn.out_proj` on its linear attention
+layers), and that `apply_lora()` wraps all of them:
+
+```bash
+python tests/check_attention_out_proj_discovery.py [hybrid-model-dir] [dense-model-dir]
+```
+
+Both models are built on the meta device from their `config.json` alone, so the
+check needs no weight files and no network access, and it runs offline against
+the local Hugging Face cache by default (the Swift1.5-Qwen3.8-Flash-Next config
+and the Qwen3-0.6B config). It also exercises further naming schemes with
+synthetic decoder layers that need no model files at all.
+
 Whenever we change any code-logic related to `src/heretic/model.py` or `config.toml` *(e.g. `row_normalization`, `full_normalization_lora_rank`, `winsorization_quantile`, etc)* which can affect a model's reproduciblity; Use these tests which are designed to verify that those changes does not affect reproducibility, unless they are meant to (like when we'll integrate ARA branch in future).
 
 ## How to test

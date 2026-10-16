@@ -213,6 +213,105 @@ def _expose_stacked_experts(experts: Module) -> None:
     )
 
 
+# Attention blocks, and the projection inside them that writes the block's
+# output back to the residual stream, are spelled differently across
+# architectures: the same hybrid model uses `self_attn.o_proj` on its full
+# attention layers and `linear_attn.out_proj` on its linear attention layers,
+# LFM operator blocks use `conv.out_proj`, GPT-2-style blocks use `attn.c_proj`,
+# and so on. Abliteration subtracts the refusal direction from exactly this
+# projection, so it is identified by what it computes (the Linear whose output
+# is the residual stream) rather than by one hardcoded path per architecture.
+#
+# Attribute names under which decoder layers expose their attention/mixer block.
+# The first three are the spellings Heretic already supported; the rest are the
+# same concept under names used by other architectures.
+ATTENTION_BLOCK_NAMES = (
+    "self_attn",
+    "linear_attn",
+    "conv",
+    "self_attention",
+    "attention",
+    "attn",
+    "mixer",
+)
+
+# Names under which architectures expose an attention block's output
+# projection.
+ATTENTION_OUT_PROJ_NAMES = (
+    "o_proj",
+    "out_proj",
+    "dense",
+    "output_linear",
+    "c_proj",
+)
+
+# Substrings identifying a direct child of an attention block that projects
+# *into* the attention computation. The shape-based fallback in
+# get_attention_out_proj must never mistake such a child for the block's output
+# projection (e.g. a q_proj whose width happens to equal the hidden size).
+ATTENTION_INPUT_PROJ_PATTERNS = (
+    "q_proj",
+    "query_proj",
+    "k_proj",
+    "key_proj",
+    "v_proj",
+    "value_proj",
+    "qkv",
+    "kv_proj",
+    "in_proj",
+    "wq",
+    "wk",
+    "wv",
+    "gate",
+    "up_proj",
+    "down_proj",
+    "indexer",
+    "norm",
+)
+
+
+def get_attention_out_proj(
+    attention: Module,
+    hidden_size: int | None,
+) -> Module | None:
+    """
+    Returns the module that writes an attention block's output back to the
+    residual stream, or None if it cannot be identified.
+
+    The module is looked up under the names architectures use for this
+    projection first, so that the result never depends on module ordering or on
+    shape coincidences. Only if no such name is present does a shape-based
+    fallback apply: a single direct Linear child whose output width is the
+    residual stream width, and which is not an input-side projection. An
+    ambiguous match is not resolved by guessing.
+
+    `hidden_size` is the width of the residual stream, or None if the model's
+    configuration does not expose it (in which case the fallback is skipped).
+    """
+    for name in ATTENTION_OUT_PROJ_NAMES:
+        module = getattr(attention, name, None)
+        if isinstance(module, Module):
+            return module
+
+    if hidden_size is None:
+        return None
+
+    candidates = [
+        child
+        for name, child in attention.named_children()
+        if isinstance(child, Linear)
+        and child.out_features == hidden_size
+        and not any(
+            pattern in name.lower() for pattern in ATTENTION_INPUT_PROJ_PATTERNS
+        )
+    ]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    return None
+
+
 class Model:
     model: PreTrainedModel | PeftModel
     tokenizer: PreTrainedTokenizerBase
@@ -535,6 +634,26 @@ class Model:
         # Text-only models.
         return model.model.layers  # ty: ignore[unresolved-attribute, invalid-return-type]
 
+    def get_hidden_size(self) -> int | None:
+        """
+        Width of the residual stream, used to recognize the projection that
+        writes an attention block's output back to it. None if the model's
+        configuration does not expose it.
+        """
+        try:
+            config = self.model.config
+
+            # Multimodal models keep the language model's dimensions in their
+            # text sub-config.
+            get_text_config = getattr(config, "get_text_config", None)
+            if callable(get_text_config):
+                config = get_text_config()
+
+            hidden_size = getattr(config, "hidden_size", None)
+            return hidden_size if isinstance(hidden_size, int) else None
+        except Exception:
+            return None
+
     def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
         layer = self.get_layers()[layer_index]
 
@@ -552,14 +671,21 @@ class Model:
                     f"Unexpected Tensor in {component} - expected nn.Module"
                 )
 
-        # Standard self-attention out-projection (most models).
-        with suppress(Exception):
-            try_add("attn.o_proj", layer.self_attn.o_proj)  # ty: ignore[unresolved-attribute]
-
-        # Qwen3.5 MoE hybrid layers use GatedDeltaNet (linear attention) instead of
-        # standard self-attention, so self_attn.o_proj doesn't exist on those layers.
-        with suppress(Exception):
-            try_add("attn.o_proj", layer.linear_attn.out_proj)  # ty: ignore[unresolved-attribute]
+        # The attention block's output projection, i.e. the Linear that writes
+        # the attention block's output back to the residual stream. Hybrid
+        # models such as Qwen3.5 MoE and Qwen4-Exp name this `self_attn.o_proj`
+        # on their full attention layers and `linear_attn.out_proj` on their
+        # linear attention layers, so both spellings (and the other ones listed
+        # above) resolve to the same component. Only one block exists per layer.
+        hidden_size = self.get_hidden_size()
+        for block_name in ATTENTION_BLOCK_NAMES:
+            with suppress(Exception):
+                attention = getattr(layer, block_name)
+                if not isinstance(attention, Module):
+                    raise TypeError(f"{block_name} is not a module")
+                out_proj = get_attention_out_proj(attention, hidden_size)
+                if out_proj is not None:
+                    try_add("attn.o_proj", out_proj)
 
         # Most dense models.
         with suppress(Exception):
@@ -591,16 +717,11 @@ class Model:
             for expert in layer.block_sparse_moe.experts:  # ty:ignore[not-iterable, unresolved-attribute]
                 try_add("mlp.down_proj", expert.w2)  # ty: ignore[unresolved-attribute]
 
-        # LFM dense operator blocks.
-        with suppress(Exception):
-            try_add("attn.o_proj", layer.conv.out_proj)  # ty: ignore[unresolved-attribute]
-
+        # LFM blocks: the feed-forward down-projection, dense and MoE variants
+        # (the attention side, conv.out_proj, is handled by the attention-block
+        # loop above).
         with suppress(Exception):
             try_add("mlp.down_proj", layer.feed_forward.w2)  # ty: ignore[unresolved-attribute]
-
-        # LFM transformer blocks.
-        with suppress(Exception):
-            try_add("attn.o_proj", layer.self_attn.out_proj)  # ty: ignore[unresolved-attribute]
 
         with suppress(Exception):
             for expert in layer.feed_forward.experts:  # ty:ignore[not-iterable, unresolved-attribute]
